@@ -1,12 +1,14 @@
 """Extract and cache gating (router) logits from open HuggingFace MoE models.
 
-Registers forward hooks on every router gate (the nn.Linear mapping hidden ->
-per-expert logits) inside each sparse-MoE block, runs a handful of prompts, and
-writes the concatenated per-layer logits to data/traces/ as a compressed .npz
-plus a JSON manifest. Each cached matrix is exactly the G in (n, m) form
-consumed by baselines.py / algorithms.py.
+Uses the official, version-stable API: model(..., output_router_logits=True)
+returns outputs.router_logits, a tuple of per-layer logits tensors of shape
+(num_tokens, num_experts). This avoids fragile module hooking and works across
+transformers v4/v5 and the Mixtral / Qwen-MoE families.
 
-Auto-detects gate modules, so it works for Mixtral and Qwen-MoE families.
+Writes concatenated per-layer logits to data/traces/ as a compressed .npz plus a
+JSON manifest. Each cached matrix is exactly the G in (n, m) form consumed by
+baselines.py / evaluate.py.
+
 DEFAULT_MODEL is a tiny MoE for a laptop smoke-run; swap --model for the full
 checkpoint on a GPU node to obtain real traces.
 """
@@ -18,7 +20,6 @@ import re
 
 import numpy as np
 import torch
-from torch import nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Loads on a laptop for a pipeline smoke-run. Real traces:
@@ -46,62 +47,58 @@ def _num_experts_from_config(cfg) -> int | None:
     return None
 
 
-def find_router_modules(model: nn.Module, num_experts: int | None):
-    """Return [(qualified_name, gate_linear)] for every MoE router gate."""
-    routers = []
-    for name, module in model.named_modules():
-        gate = getattr(module, "gate", None)
-        if isinstance(gate, nn.Linear):
-            if num_experts is None or gate.out_features == num_experts:
-                routers.append((f"{name}.gate", gate))
-    return routers
+def _load_model(model_id: str, dtype: torch.dtype):
+    """Load a causal-LM checkpoint, tolerating the v4 (torch_dtype) /
+    v5 (dtype) keyword rename."""
+    try:
+        return AutoModelForCausalLM.from_pretrained(
+            model_id, dtype=dtype, trust_remote_code=True)
+    except TypeError:
+        return AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=dtype, trust_remote_code=True)
 
 
 @torch.no_grad()
 def extract(model_id: str, device: str, dtype: torch.dtype,
             max_tokens: int, num_prompts: int):
     tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, torch_dtype=dtype, trust_remote_code=True
-    ).to(device).eval()
-
+    model = _load_model(model_id, dtype).to(device).eval()
+    model.config.output_router_logits = True
     cfg = model.config
-    num_experts = _num_experts_from_config(cfg)
-    routers = find_router_modules(model, num_experts)
-    if not routers:
-        raise RuntimeError("No MoE router gate found; is this a MoE checkpoint?")
 
-    buffers: dict[str, list[np.ndarray]] = {name: [] for name, _ in routers}
+    buffers: dict[int, list[np.ndarray]] = {}
+    for prompt in SAMPLE_PROMPTS[:num_prompts]:
+        ids = tok(prompt, return_tensors="pt",
+                  truncation=True, max_length=max_tokens).to(device)
+        out = model(**ids, output_router_logits=True)
+        rl = getattr(out, "router_logits", None)
+        if not rl:
+            raise RuntimeError(
+                "Model returned no router_logits. Use a MoE checkpoint that "
+                "supports output_router_logits (e.g. Mixtral or Qwen-MoE).")
+        for i, logit in enumerate(rl):
+            if logit is None:
+                continue
+            arr = (logit.detach().to(torch.float32)
+                   .reshape(-1, logit.shape[-1]).cpu().numpy().astype(np.float16))
+            buffers.setdefault(i, []).append(arr)
 
-    def make_hook(name: str):
-        def hook(_m, _inp, out):
-            logits = out[0] if isinstance(out, tuple) else out
-            arr = logits.detach().to(torch.float32).reshape(-1, logits.shape[-1])
-            buffers[name].append(arr.cpu().numpy().astype(np.float16))
-        return hook
+    traces = {f"layer_{i:02d}": np.concatenate(v, axis=0)
+              for i, v in sorted(buffers.items()) if v}
+    if not traces:
+        raise RuntimeError("No router logits captured.")
 
-    handles = [g.register_forward_hook(make_hook(n)) for n, g in routers]
-    try:
-        for prompt in SAMPLE_PROMPTS[:num_prompts]:
-            ids = tok(prompt, return_tensors="pt",
-                      truncation=True, max_length=max_tokens).to(device)
-            model(**ids)
-    finally:
-        for h in handles:
-            h.remove()
-
-    traces = {re.sub(r"[^0-9a-zA-Z]+", "_", n): np.concatenate(v, axis=0)
-              for n, v in buffers.items() if v}
     inferred = next(iter(traces.values())).shape[1]
-    n_layers = max(len(traces), 1)
+    n_layers = len(traces)
     manifest = {
         "model_id": model_id,
-        "num_experts": int(num_experts or inferred),
+        "num_experts": int(_num_experts_from_config(cfg) or inferred),
         "top_k": int(getattr(cfg, "num_experts_per_tok", 0)
                      or getattr(cfg, "moe_top_k", 0) or 0),
-        "num_router_layers": len(traces),
+        "num_router_layers": n_layers,
         "hidden_size": int(getattr(cfg, "hidden_size", 0)),
-        "tokens_per_layer": int(sum(a.shape[0] for a in traces.values()) // n_layers),
+        "tokens_per_layer": int(sum(a.shape[0] for a in traces.values())
+                                // max(n_layers, 1)),
         "dtype": "float16",
         "layer_keys": sorted(traces.keys()),
     }
