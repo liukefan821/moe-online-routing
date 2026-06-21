@@ -1,18 +1,18 @@
 """evaluate.py — offline evaluation harness for online MoE routing.
 
-Loads cached gate-logit traces (data/traces/*.npz), runs WFPD and the baselines
-on each token block, and reports paper-grade metrics against the true offline
-optimum (OPT, via a HiGHS LP): retained-score ratio (ALG/OPT), max-load, Gini,
-served fraction, and mean experts/token. Aggregates over MoE layers, writes a
-CSV summary, and renders comparison figures (PDF+PNG) for the paper.
+Loads cached gate-logit traces (data/traces/*.npz) and evaluates EACH model
+(trace file) SEPARATELY — results across different models are never pooled, and
+each model uses its own top-k / expert count from its manifest. For every model,
+runs WFPD and the baselines per token block and reports paper-grade metrics
+against the true offline optimum (OPT, via a HiGHS LP): retained-score ratio
+(ALG/OPT), max-load, Gini, served fraction, and mean experts/token. Writes a
+per-model CSV (with a `model` column) and one comparison figure per model.
 
-Why ratio-to-OPT instead of raw objective: routers that violate the "<= k experts
-per token" budget (e.g. Expert-choice) inflate raw objective and look artificially
-strong. Measuring ALG / OPT under the SAME (<=k, <=C) constraints is the rigorous
-competitive ratio of Theorem 1 (guaranteed >= 1 - 1/e ~ 0.632; typically near 1).
+Why ratio-to-OPT: routers that violate the "<= k experts per token" budget
+(e.g. Expert-choice) inflate raw objective. ALG / OPT under the SAME (<=k, <=C)
+constraints is the competitive ratio of Theorem 1 (>= 1 - 1/e ~ 0.632).
 
 Run from the project root:
-    python src/moe_routing/trace_extract.py        # produce data/traces/*.npz first
     python src/moe_routing/evaluate.py
     python src/moe_routing/evaluate.py --cap-factor 1.25 --score softmax
 """
@@ -21,13 +21,13 @@ import argparse
 import glob
 import json
 import os
+import re
 import sys
 
 import numpy as np
 from scipy.optimize import linprog
 import scipy.sparse as sp
 
-# sibling modules (script dir is on sys.path when run as a file)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from algorithms import WaterFillingRouter                          # noqa: E402
 from baselines import (TokenChoiceRouter, ExpertChoiceRouter,      # noqa: E402
@@ -39,6 +39,7 @@ ROUTERS = {
     "Expert-choice": ExpertChoiceRouter,
     "LPR (OT)": LPRRouter,
 }
+COLS = ["retained", "gini", "Lmax/C", "minmax", "served", "experts/tok"]
 
 
 def to_scores(logits: np.ndarray, mode: str) -> np.ndarray:
@@ -112,7 +113,7 @@ def aggregate(per_router: dict) -> dict:
     return summary
 
 
-def make_figures(summary: dict, out_dir: str) -> str:
+def make_figures(summary: dict, out_dir: str, tag: str, title: str) -> str:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -125,10 +126,10 @@ def make_figures(summary: dict, out_dir: str) -> str:
         ("Max-load / capacity", [summary[n]["Lmax/C"] for n in names], None),
     ]
     fig, axes = plt.subplots(1, 3, figsize=(13, 4))
-    for ax, (title, vals, ref) in zip(axes, panels):
+    for ax, (panel_title, vals, ref) in zip(axes, panels):
         bars = ax.bar(names, vals, color="#9ca3af")
         bars[0].set_color("#2563eb")                # highlight WFPD
-        ax.set_title(title, fontsize=11)
+        ax.set_title(panel_title, fontsize=11)
         ax.tick_params(axis="x", rotation=20)
         if ref is not None:
             ax.axhline(ref, ls="--", c="#dc2626", lw=1)
@@ -137,10 +138,11 @@ def make_figures(summary: dict, out_dir: str) -> str:
         for b, v in zip(bars, vals):
             ax.text(b.get_x() + b.get_width() / 2, v, f"{v:.3f}",
                     ha="center", va="bottom", fontsize=8)
+    fig.suptitle(title, fontsize=10)
     fig.tight_layout()
-    pdf = os.path.join(out_dir, "comparison.pdf")
+    pdf = os.path.join(out_dir, f"comparison_{tag}.pdf")
     fig.savefig(pdf)
-    fig.savefig(os.path.join(out_dir, "comparison.png"), dpi=150)
+    fig.savefig(os.path.join(out_dir, f"comparison_{tag}.png"), dpi=150)
     plt.close(fig)
     return pdf
 
@@ -162,40 +164,47 @@ def main() -> None:
     if not npz_files:
         sys.exit(f"No traces in {args.traces}; run trace_extract.py first.")
 
-    all_records = {name: [] for name in ROUTERS}
-    k_used = None
+    csv_rows = []                                   # (model_id, k, router, summary_dict)
     for npz in npz_files:
         man_path = npz.replace("_gate_logits.npz", "_manifest.json")
         manifest = json.load(open(man_path)) if os.path.exists(man_path) else {}
-        per_router, k_used = evaluate_trace(
+        model_id = manifest.get("model_id") or os.path.basename(npz)
+
+        per_router, k = evaluate_trace(
             npz, manifest, args.cap_factor, args.block_size,
             args.max_tokens, args.score)
-        for name, recs in per_router.items():
-            all_records[name].extend(recs)
+        summary = aggregate(per_router)
+        if not summary:
+            print(f"\n[skip] {model_id}: no evaluable blocks (too few tokens?).")
+            continue
 
-    summary = aggregate(all_records)
-    if not summary:
-        sys.exit("No evaluable blocks (traces too small?).")
+        m_exp = manifest.get("num_experts", "?")
+        print(f"\n=== {model_id}   top-k={k}  experts={m_exp}  score={args.score} ===")
+        header = f"{'router':14s} " + " ".join(f"{c:>12s}" for c in COLS)
+        print(header)
+        print("-" * len(header))
+        for name, s in summary.items():
+            print(f"{name:14s} " + " ".join(f"{s[c]:12.4f}" for c in COLS))
+            csv_rows.append((model_id, k, name, s))
 
-    cols = ["retained", "gini", "Lmax/C", "minmax", "served", "experts/tok"]
-    header = f"{'router':14s} " + " ".join(f"{c:>12s}" for c in cols)
-    print(f"\nscore={args.score}   top-k={k_used}   cap-factor={args.cap_factor}")
-    print(header)
-    print("-" * len(header))
-    for name, s in summary.items():
-        print(f"{name:14s} " + " ".join(f"{s[c]:12.4f}" for c in cols))
+        tag = re.sub(r"[^0-9a-zA-Z]+", "_", model_id)
+        os.makedirs(args.figures, exist_ok=True)
+        make_figures(summary, args.figures, tag, model_id)
+
+    if not csv_rows:
+        sys.exit("No evaluable blocks found across any trace.")
 
     os.makedirs(args.results, exist_ok=True)
     csv_path = os.path.join(args.results, "eval_summary.csv")
     with open(csv_path, "w") as f:
-        f.write("router," + ",".join(cols) + "\n")
-        for name, s in summary.items():
-            f.write(name + "," + ",".join(f"{s[c]:.6f}" for c in cols) + "\n")
+        f.write("model,top_k,router," + ",".join(COLS) + "\n")
+        for model_id, k, name, s in csv_rows:
+            f.write(f"{model_id},{k},{name}," +
+                    ",".join(f"{s[c]:.6f}" for c in COLS) + "\n")
 
-    os.makedirs(args.figures, exist_ok=True)
-    pdf = make_figures(summary, args.figures)
-    print(f"\nsaved table  -> {csv_path}")
-    print(f"saved figure -> {pdf}")
+    n_models = len({r[0] for r in csv_rows})
+    print(f"\nsaved table -> {csv_path}")
+    print(f"saved {n_models} per-model figure(s) -> {args.figures}")
 
 
 if __name__ == "__main__":
