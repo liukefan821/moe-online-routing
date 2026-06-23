@@ -1,0 +1,569 @@
+% =====================================================================
+%  FULL PAPER -- EMPIRICAL / SYSTEMS VERSION (Option B)
+%  Elsevier elsarticle / JPDC
+%
+%  "Online Capacitated Routing for Mixture-of-Experts:
+%   A Single-Pass Water-Filling Router for Load Balancing
+%   without Auxiliary Losses"
+%
+%  WHAT CHANGED vs the earlier draft (and WHY):
+%   - REMOVED the competitive-ratio theorem and the max-load theorem.
+%     A verified counterexample shows the (1-1/e) claim is FALSE for
+%     count-capacity, continuous gate scores under adversarial order;
+%     and WFPD's monotone price does NOT reach near-optimality under
+%     random order either (verified numerically: ALG/OPT plateaus ~0.85,
+%     not -> 1). A provably (1-eps) variant needs a different price
+%     update (dual mirror descent) -- that is a separate paper.
+%   - This version is an honest empirical/systems contribution: online
+%     packing FORMULATION + LP optimum as an EVALUATION BENCHMARK +
+%     a lightweight water-filling heuristic + constant-time complexity
+%     (the one theorem that is true) + strong trace-driven experiments.
+%
+%  Compile: pdflatex (bibliography is inline). Needs: elsarticle,
+%  amsthm, algorithm, algpseudocode, booktabs. Times via newtx
+%  (delete the two newtx lines if your install clashes).
+%
+%  >>> VERIFY all \bibitem details before submission.
+% =====================================================================
+\documentclass[preprint,12pt]{elsarticle}
+
+\usepackage{newtxtext,newtxmath}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{url}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+\newcommand{\opt}{\mathrm{OPT}}
+\newcommand{\alg}{\mathrm{ALG}}
+\newcommand{\Lmax}{L_{\max}}
+
+\journal{Journal of Parallel and Distributed Computing}
+
+\begin{document}
+
+\begin{frontmatter}
+
+\title{Online Capacitated Routing for Mixture-of-Experts:
+A Single-Pass Water-Filling Router for Load Balancing without Auxiliary
+Losses}
+
+\author{Kefan Liu}
+\ead{kefan001@e.ntu.edu.sg}
+\affiliation{organization={Centre in Computational Technologies for Finance (CCTF), Nanyang Technological University},
+             city={Singapore},
+             country={Singapore}}
+
+\begin{abstract}
+Mixture-of-Experts (MoE) models route each token to a few of many experts,
+and balanced expert load is essential for parallel utilisation: the
+throughput of an MoE layer is set by its busiest expert. Yet the standard
+top-$k$ gate balances poorly and is propped up by auxiliary load-balancing
+losses and capacity-dropping heuristics that are tied to training and
+require tuning. We formulate inference-time expert routing as an
+\emph{online capacitated packing} problem---tokens stream in and each is
+routed to at most $k$ of $m$ capacity-limited experts to maximise total
+gate score---and use its offline linear-programming optimum as a strong
+benchmark for measuring routing quality. We propose WFPD, a lightweight
+single-pass \emph{water-filling} router: each expert carries a price that
+rises as it fills, and each token is sent to its top-$k$ positive-surplus
+experts, so load balancing emerges from the routing rule itself, with no
+auxiliary loss, no token-dropping heuristic and no tuning. WFPD updates in
+$O(m+k\log C)$ time and $O(m)$ space per token, independent of sequence
+length. On real routing traces from \textsc{OLMoE-1B-7B}, WFPD consistently
+improves over the standard token-choice gate, retaining $95\%$ of the
+offline optimum versus $88\%$ while halving the load imbalance, and matches
+an iterative optimal-transport solver while balancing better---in a single
+online pass at stable throughput.
+\end{abstract}
+
+\begin{keyword}
+mixture-of-experts \sep online routing \sep load balancing \sep
+resource allocation \sep inference systems
+\end{keyword}
+
+\end{frontmatter}
+
+% =====================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Mixture-of-Experts (MoE) layers scale neural networks without a
+proportional increase in compute: each token is processed by only a few of
+many expert sub-networks, so the parameter count can grow while the
+per-token cost stays fixed~\cite{shazeer2017,switch}. A lightweight
+\emph{router} decides, for every token, which $k$ of the $m$ experts handle
+it. Because the experts run in parallel, often sharded across devices, the
+throughput of an MoE layer is set by its \emph{busiest} expert: if the
+router concentrates tokens on a few popular experts the rest sit idle,
+capacity is wasted, and overloaded experts drop tokens, hurting
+quality~\cite{gshard,switch}. Keeping the per-expert load balanced is thus a
+parallel resource-allocation problem at the heart of MoE efficiency.
+
+The prevailing remedies are heuristic and training-coupled. The dominant
+\emph{token-choice} gate---each token greedily takes its $k$ highest-scoring
+experts---is balanced only by adding an \emph{auxiliary load-balancing
+loss} to the training objective and by a \emph{capacity factor} that drops
+tokens once an expert is full~\cite{switch,gshard}. These devices tangle
+balancing into training, need tuning, and still leave the realised load
+uneven. \emph{Expert-choice} routing~\cite{expertchoice} inverts the
+assignment so each expert selects its favourite tokens, which balances load
+but assigns a variable number of experts per token and needs the whole
+batch at once. \textsc{BASE} layers~\cite{baselayers} solve a global
+linear-assignment problem per layer, again requiring all tokens
+simultaneously.
+
+We take an online view. At inference time, routing is fundamentally an
+online problem: tokens arrive one at a time, the router must commit each
+before seeing the next, and every expert has a finite capacity. We
+formulate inference-time MoE routing as \emph{online capacitated packing}.
+This formulation does two things: it gives a clean, assumption-light
+statement of the routing task, and it yields the offline LP optimum as a
+strong yardstick against which any router can be measured. We then design a
+simple router for this setting and evaluate it on real MoE routing traces.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\item We formulate inference-time MoE routing as an online capacitated
+packing problem (Section~\ref{sec:problem}) and use its offline linear-%
+programming optimum as a benchmark for routing quality.
+\item We propose \emph{WFPD}, a lightweight single-pass water-filling router
+(Section~\ref{sec:algo}). A per-expert price rises as the expert fills and
+each token is routed to its top-$k$ positive-surplus experts, so load
+balancing emerges from the routing rule---no auxiliary loss, no token
+dropping, no tuning---with $O(m+k\log C)$ time and $O(m)$ space per token,
+independent of sequence length (Theorem~\ref{thm:complexity}).
+\item We evaluate WFPD on real routing traces from
+\textsc{OLMoE-1B-7B} (Section~\ref{sec:exp}). It consistently improves on
+the standard token-choice gate in both retained gate score and load
+balance, and matches an iterative optimal-transport solver while balancing
+better, in a single online pass at stable throughput.
+\end{enumerate}
+
+We keep the contribution empirical and systems-oriented. As we discuss in
+Section~\ref{sec:algo}, no fixed online rule can guarantee a constant
+fraction of the offline optimum for continuous gate scores under
+adversarial arrival order; designing a router with provable guarantees in a
+stochastic or random-order model is a separate question that we leave to
+future work (Section~\ref{sec:conclusion}).
+
+% =====================================================================
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Routing in Mixture-of-Experts.}
+Sparsely-gated MoE layers were introduced by Shazeer et
+al.~\cite{shazeer2017} and scaled by GShard~\cite{gshard} and Switch
+Transformer~\cite{switch}, which established the now-standard recipe of a
+token-choice gate regularised by an auxiliary load-balancing loss and a
+capacity factor with token dropping. Recent open models such as
+Mixtral~\cite{mixtral} and \textsc{OLMoE}~\cite{olmoe} follow the same
+template. Two lines change the assignment to improve balance:
+Expert-Choice routing~\cite{expertchoice} lets each expert pick its top
+tokens, and \textsc{BASE} layers~\cite{baselayers} solve a global linear
+assignment per layer; both are full-batch and trade away the streaming,
+per-token structure of autoregressive inference. WFPD keeps the
+token-choice interface---one token at a time, at most $k$ experts each---but
+replaces the greedy gate with a priced one that balances load
+intrinsically, without an auxiliary loss.
+
+\paragraph{Online resource allocation.}
+Our formulation places MoE routing in the setting of online capacitated
+assignment, which has a rich theory: online bipartite
+matching~\cite{kvv}, budgeted allocation and the AdWords
+problem~\cite{adwords}, and the online primal--dual
+framework~\cite{buchbinder}. In the random-order and stochastic models,
+online packing LPs admit near-optimal guarantees once capacities are
+large~\cite{devanurhayes,awy,krtv,blm}. We use this lens for problem
+framing and for benchmarking against the offline optimum; designing a
+router with provable competitive guarantees in this model---which, as we
+note in Section~\ref{sec:algo}, requires a price update different from
+ours---is a direction we leave to future work.
+
+\paragraph{Load balancing.}
+The balls-into-bins and power-of-two-choices
+literature~\cite{twochoices,mitzenmacher} studies how to keep the maximum
+load close to the mean; WFPD's price mechanism makes a token less likely to
+land on a heavily-loaded expert, in the same spirit, but as a deterministic
+routing rule rather than a randomised allocation.
+
+\paragraph{Optimal transport for balanced assignment.}
+Balanced routing can be cast as an optimal-transport problem and solved with
+Sinkhorn iterations~\cite{sinkhorn}; we use such a solver (\textsc{LPR}) as
+a strong quality baseline. It is iterative and full-batch, with an iteration
+count and a convergence tolerance to tune, whereas WFPD operates in a single
+online pass.
+
+% =====================================================================
+\section{Problem Formulation}
+\label{sec:problem}
+
+\paragraph{Setup.}
+A stream of $n$ tokens arrives one at a time and must be routed among $m$
+experts. Token $t$ is revealed with its \emph{gate scores}
+$g_{t,e}\in[0,1]$ for every expert $e\in[m]$; in practice $g_{t,e}$ is the
+softmax of the router logit. Each token may be sent to at most $k$ experts
+(the top-$k$ budget), and each expert can process at most $C$ tokens (its
+\emph{capacity}). The objective is to maximise the total served gate score
+$\alg=\sum_{t}\sum_{e\in S_t} g_{t,e}$, where $S_t$ is the set of experts
+chosen for token $t$ and $|S_t|\le k$. In the online model, $S_t$ is
+committed before token $t+1$ is revealed and is irrevocable, and an expert
+that has accepted $C$ tokens is unavailable.
+
+\paragraph{Offline optimum as a benchmark.}
+To measure how much routing quality a router achieves, we compare its served
+gate score against the clairvoyant offline optimum of the capacitated
+assignment LP, with $x_{t,e}\in[0,1]$:
+\begin{equation}
+\label{eq:primal}
+\begin{aligned}
+  \opt=\max_{x\ge 0}\ & \sum_{t,e} g_{t,e}\,x_{t,e}\\
+  \text{s.t.}\quad
+  & \textstyle\sum_{e} x_{t,e}\le k && \forall t\quad(\text{budget})\\
+  & \textstyle\sum_{t} x_{t,e}\le C && \forall e\quad(\text{capacity})\\
+  & x_{t,e}\le 1 && \forall t,e.
+\end{aligned}
+\end{equation}
+$\opt$ is the largest total gate score attainable by any assignment that
+sends each token to at most $k$ experts and never exceeds capacity $C$. It
+is not attainable online---it requires seeing all tokens at once---but it is
+a tight upper bound and serves as our evaluation yardstick: we report each
+router's served score as a fraction of $\opt$ (the \emph{retained} metric of
+Section~\ref{sec:exp}).
+
+% =====================================================================
+\section{The WFPD Router}
+\label{sec:algo}
+
+\paragraph{Design rationale.}
+WFPD attaches to each expert a \emph{price} $\beta_e$---a congestion signal,
+or water level, that rises as the expert fills. A token sees the
+\emph{surplus} $\sigma_{t,e}=g_{t,e}-\beta_e$ of each expert and is routed to
+the (at most $k$) experts of largest positive surplus. Whenever an expert
+serves a token its price is raised multiplicatively, so popular experts
+become progressively more expensive and later tokens are deflected toward
+cheaper, less-loaded alternatives. Load balancing is thus emergent from the
+routing rule: there is no auxiliary load-balancing loss, no
+capacity-dropping heuristic and no global view of the layer. The growth rate
+is calibrated so that the price approaches saturation as the expert
+approaches capacity. WFPD is summarised in Algorithm~\ref{alg:wfpd}.
+
+\begin{algorithm}[t]
+\caption{Water-Filling Router (WFPD)}
+\label{alg:wfpd}
+\begin{algorithmic}[1]
+\Require experts $[m]$, capacity $C$, budget $k$; stream of gate scores
+\State $\beta_e\gets 0,\ \ n_e\gets 0$ \textbf{ for all } $e\in[m]$
+   \Comment{prices and per-expert load counters}
+\State $M\gets (1+1/C)^{C}-1$
+\For{each arriving token $t$ with scores $(g_{t,e})_{e\in[m]}$}
+  \State $\sigma_{t,e}\gets g_{t,e}-\beta_e$ \textbf{ for all } $e$ with $n_e<C$
+         \Comment{surplus of admissible experts}
+  \State $S_t\gets$ the (at most $k$) experts with largest $\sigma_{t,e}>0$
+  \For{$e\in S_t$}
+     \State route token $t$ to expert $e$;\ \ $n_e\gets n_e+1$
+     \State $\beta_e\gets \beta_e\,(1+1/C)+g_{t,e}/(C\,M)$
+            \Comment{raise the water level}
+  \EndFor
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Scope.}
+WFPD is a heuristic, and we are deliberate about what we claim for it. The
+price update is an online analogue of water-filling, but it does \emph{not}
+come with a worst-case competitive guarantee. Under adversarially ordered
+inputs with continuous gate scores, no fixed online routing rule can
+guarantee a constant fraction of the offline optimum: a low-score token can
+occupy a slot that a later high-score token would have used, and an
+adversary can force this on any algorithm that must commit irrevocably. Our
+design instead targets realistic token streams, on which---as
+Section~\ref{sec:exp} shows---the rule performs strongly. A variant with
+provable guarantees under random-order or stochastic arrivals would require
+a price update that can both rise and fall toward a target utilisation
+(rather than the monotone update above); we regard this as a separate
+contribution and leave it to future work.
+
+\begin{theorem}[Per-token complexity]
+\label{thm:complexity}
+WFPD processes each token in $O(m+k\log C)$ time and uses $O(m)$ space.
+\end{theorem}
+
+\begin{proof}
+The state consists of the prices $\beta_e$ and counters $n_e$, i.e.\ $O(m)$
+space. Per token, evaluating the $m$ surpluses costs $O(m)$. Selecting the
+$k$ largest positive surpluses and updating the prices and counters of those
+$k$ experts costs $O(k\log C)$ using a priority queue keyed by surplus, the
+$\log C$ factor accounting for the reorganisation of an expert as its load
+counter advances through its $C$ capacity levels. The total $O(m+k\log C)$
+is independent of the sequence length $n$.
+\end{proof}
+
+\begin{remark}
+Theorem~\ref{thm:complexity} is the formal counterpart of the empirical
+observation (Section~\ref{sec:exp-throughput}) that WFPD's per-token cost is
+flat in $n$: the price bookkeeping adds a constant overhead per token, never
+a growing one, which makes the router suitable for streaming, single-pass
+inference.
+\end{remark}
+
+% =====================================================================
+\section{Experimental Evaluation}
+\label{sec:exp}
+
+We evaluate WFPD against three baselines on the routing traces of a real
+MoE language model, asking how much of the offline routing quality it
+retains, how well it balances expert load, and what its per-token cost is.
+
+\subsection{Setup}
+\label{sec:exp-setup}
+
+\paragraph{Model and corpus.}
+We use \textsc{OLMoE-1B-7B}~\cite{olmoe} ($6.9$B parameters; $1$B active),
+which routes each token to $k=8$ of $m=64$ experts in every one of its $16$
+MoE layers. We run the model in $4$-bit precision on a single commodity GPU
+and feed it $128$ documents from \textsc{WikiText-2}~\cite{wikitext}. At
+each token position we record the router logits of every MoE layer; after a
+softmax these give the per-token gate scores $g_{t,e}\in[0,1]$. This
+produces roughly $8.8\times10^{3}$ token-to-expert routing events per layer,
+aggregated across all layers for the statistics below.
+
+\paragraph{Capacity and the offline optimum.}
+For $n$ tokens we set the per-expert capacity to $C=\lceil\gamma\,nk/m\rceil$
+with slack $\gamma=1.25$. For each layer we compute the offline optimum
+$\opt$ of \eqref{eq:primal} exactly with the HiGHS LP solver and report
+quality relative to it.
+
+\paragraph{Metrics.}
+\textbf{Retained} $=\alg/\opt$, the fraction of the offline-optimal total
+gate score captured online; \textbf{Gini}, the Gini coefficient of the
+per-expert load ($0=$ balanced); $\boldsymbol{\Lmax/C}$, the busiest
+expert's load relative to capacity; \textbf{Min/Max}, the ratio of the
+least- to the most-loaded expert ($0=$ a starved expert); \textbf{Exp./tok}, the average number of experts per token (must be $\le k$
+for a budget-respecting router).
+
+\paragraph{Baselines.}
+\textsc{Token-choice} is the standard top-$k$ gate: each token greedily
+takes its $k$ best experts and is dropped from any whose capacity is full.
+\textsc{Expert-choice}~\cite{expertchoice} inverts the assignment---each
+expert selects its top-$C$ tokens---balancing load perfectly but not
+respecting a per-token budget. \textsc{LPR (OT)} solves an entropic
+optimal-transport relaxation with Sinkhorn iterations~\cite{sinkhorn}; it is
+iterative and full-batch and serves as a strong offline-style quality
+reference.
+
+\subsection{Routing Quality}
+\label{sec:exp-quality}
+
+\begin{table}[t]
+\centering
+\caption{Routing quality on \textsc{OLMoE-1B-7B} ($m=64$, $k=8$),
+aggregated over all MoE layers ($\approx 8.8$k routings/layer). Higher
+\emph{Retained}, \emph{Min/Max} and lower \emph{Gini} are
+better. Bold marks the best value among the three \emph{budget-respecting}
+routers.}
+\label{tab:quality}
+\begin{tabular}{lrrrrr}
+\toprule
+Router & Retained & Gini & $\Lmax/C$ & Min/Max & Exp./tok \\
+\midrule
+WFPD (ours)               & 0.953          & \textbf{0.106} & 1.00 & \textbf{0.380} & 7.78 \\
+Token-choice              & 0.877          & 0.245          & 1.00 & 0.069          & 6.75 \\
+Expert-choice$^{\dagger}$ & 1.102          & 0.000          & 1.00 & 1.000          & 10.00 \\
+LPR (OT)                  & \textbf{0.969} & 0.141          & 1.00 & 0.267          & 8.00 \\
+\bottomrule
+\end{tabular}
+\\[3pt]
+{\footnotesize $\dagger$~\textsc{Expert-choice} does not respect the
+per-token budget (Exp./tok $=10>k=8$); reported for reference only.}
+\end{table}
+
+\paragraph{WFPD improves on the standard gate on both axes.}
+Against \textsc{Token-choice}---the rule deployed in real MoE models---WFPD
+is better on \emph{both} axes at once. It retains $95.3\%$ of the offline
+optimum versus $87.7\%$, a $7.6$-point ($8.7\%$ relative) gain in served
+gate score, while simultaneously more than halving the load imbalance (Gini
+$0.106$ vs.\ $0.245$). The gap is sharpest in the tail:
+\textsc{Token-choice} drives its least-used expert down to $6.9\%$ of the
+busiest expert's load (Min/Max $=0.069$), whereas WFPD holds it at $38.0\%$.
+The greedy gate also \emph{wastes} budget---its $6.75$ experts/token, well
+below $k=8$, are tokens whose preferred experts were saturated and were
+discarded---while WFPD's priced routing redirects those tokens to
+near-optimal alternatives, spending $7.78$ experts/token.
+
+\paragraph{Competitive with the OT solver, better balanced.}
+\textsc{LPR} retains marginally more gate score than WFPD ($0.969$ vs.\
+$0.953$), as expected of an iterative full-batch optimiser with a global
+view. Yet WFPD is the better balanced of the two (Gini $0.106$ vs.\ $0.141$;
+Min/Max $0.380$ vs.\ $0.267$) and, as Section~\ref{sec:exp-throughput}
+shows, achieves this in a single online pass with constant per-token work
+and no iteration count or convergence tolerance to tune.
+
+\paragraph{On Expert-choice.}
+\textsc{Expert-choice} appears flawless---zero Gini, Min/Max $=1$, Retained
+$>1$---but only because it solves a \emph{less constrained} problem: it
+assigns a variable number of experts per token ($10$ on average, exceeding
+$k=8$), letting it both fill every expert exactly and surpass the top-$k$
+optimum that defines $\opt$. It is not a valid competitor in the online
+top-$k$ setting and is included only to indicate what relaxing the per-token
+budget would buy.
+
+\paragraph{Reading the balance metrics.}
+Every router reports $\Lmax/C\approx 1$: at $\gamma=1.25$ slack all methods
+saturate the busiest expert, so Gini and Min/Max---not $\Lmax/C$---are the
+discriminating balance statistics here. WFPD's $7.78\le k$ experts/token
+confirms it respects the per-token budget (unlike Expert-choice), and its
+retained value of $0.953$ shows it captures almost all of the offline
+optimum on this real workload while keeping load far more even than the
+deployed gate.
+
+\subsection{Throughput}
+\label{sec:exp-throughput}
+
+We measure per-token routing latency as the number of tokens $n$ grows,
+averaged over $15$ trials at $m=64$ (routing only; expert compute
+excluded). WFPD costs $\approx 7.3\,\mu$s per token and, crucially, this
+cost is flat in $n$ (from $n=256$ to $n=4096$), matching the constant
+per-token complexity of Theorem~\ref{thm:complexity}. \textsc{Token-choice}
+is slightly cheaper ($\approx 5.3\,\mu$s), \textsc{Expert-choice} is the
+fastest ($\approx 0.7\,\mu$s) as it reduces to one per-expert top-$C$
+selection, and \textsc{LPR} ranges over $\approx 5$--$7\,\mu$s with variance
+that grows in $n$ because of its Sinkhorn iterations. WFPD is not the
+wall-clock-fastest router, and speed is not its contribution; its advantage
+is structural---online and single-pass, iteration-free, $O(m)$ state, and
+free of any auxiliary loss or tuned capacity-dropping heuristic---at a
+small, constant per-token overhead.
+
+\subsection{Discussion}
+\label{sec:exp-discussion}
+
+On real MoE routing traces, WFPD consistently improves on the standard
+\textsc{Token-choice} gate in both retained gate score and load balance,
+matches an iterative optimal-transport solver to within $1.6$ points of gate
+score while balancing load better than it, and respects the per-token expert
+budget---all in a single online pass at constant per-token cost. The
+formulation of routing as online capacitated packing, with the offline LP as
+a yardstick, makes these comparisons precise; the water-filling rule turns
+that yardstick into a practical, parameter-free router.
+
+% =====================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We formulated inference-time MoE routing as an online capacitated packing
+problem and introduced WFPD, a lightweight single-pass water-filling router
+that balances expert load as an intrinsic property of its routing rule, with
+no auxiliary loss, no token-dropping heuristic and no tuning, at constant
+$O(m+k\log C)$ cost per token. On real \textsc{OLMoE-1B-7B} traces it
+consistently improves on the standard token-choice gate on both quality and
+balance and matches an iterative optimal-transport solver while balancing
+better, in a single pass.
+
+Several directions remain. First, the online-packing formulation invites a
+router with \emph{provable} guarantees in the random-order or stochastic
+arrival model; as we noted, this requires a price update that can both rise
+and fall toward a target utilisation---a dual mirror-descent
+scheme~\cite{blm}---rather than the monotone update used here, and is a
+natural follow-up. Second, our study uses one MoE family; a sweep across
+architectures and scales would further test the router. Third, integrating
+WFPD as a drop-in inference router and measuring end-to-end throughput on
+expert-parallel hardware---where a lower maximum load should translate into
+wall-clock speedups---is a systems follow-up well suited to a
+parallel-computing setting.
+
+% =====================================================================
+%  ELSEVIER-REQUIRED STATEMENTS (after Conclusion, before References)
+% =====================================================================
+\section*{Declaration of competing interest}
+The author declares that she has no known competing financial interests or
+personal relationships that could have appeared to influence the work
+reported in this paper.
+
+\section*{Data availability}
+The source code, the routing-trace extraction pipeline and the extracted
+\textsc{OLMoE-1B-7B} traces used in this study are publicly available at
+\url{https://github.com/liukefan821/moe-online-routing}.
+
+\section*{Declaration of generative AI in scientific writing}
+During the preparation of this work the author used Claude (Anthropic) in
+order to assist with drafting and editing prose. After using this tool the
+author reviewed and edited the content as needed and takes full
+responsibility for the content of the publication.
+
+% =====================================================================
+%  BIBLIOGRAPHY -- best-effort; VERIFY every entry before submission.
+% =====================================================================
+\begin{thebibliography}{99}
+
+\bibitem{shazeer2017} N.~Shazeer, A.~Mirhoseini, K.~Maziarz, A.~Davis,
+Q.~Le, G.~Hinton, J.~Dean, Outrageously large neural networks: The
+sparsely-gated mixture-of-experts layer, in: ICLR, 2017.
+
+\bibitem{gshard} D.~Lepikhin, H.~Lee, Y.~Xu, D.~Chen, O.~Firat, Y.~Huang,
+M.~Krikun, N.~Shazeer, Z.~Chen, {GShard}: Scaling giant models with
+conditional computation and automatic sharding, in: ICLR, 2021.
+
+\bibitem{switch} W.~Fedus, B.~Zoph, N.~Shazeer, Switch transformers:
+Scaling to trillion parameter models with simple and efficient sparsity,
+Journal of Machine Learning Research 23 (120) (2022) 1--39.
+
+\bibitem{expertchoice} Y.~Zhou, T.~Lei, H.~Liu, N.~Du, Y.~Huang, V.~Zhao,
+A.~Dai, Z.~Chen, Q.~Le, J.~Laudon, Mixture-of-experts with expert choice
+routing, in: NeurIPS, 2022.
+
+\bibitem{baselayers} M.~Lewis, S.~Bhosale, T.~Dettmers, N.~Goyal,
+L.~Zettlemoyer, {BASE} layers: Simplifying training of large, sparse
+models, in: ICML, 2021.
+
+\bibitem{mixtral} A.~Q. Jiang, A.~Sablayrolles, A.~Roux, et al., Mixtral of
+experts, arXiv:2401.04088 (2024).
+
+\bibitem{olmoe} N.~Muennighoff, L.~Soldaini, D.~Groeneveld, et al.,
+{OLMoE}: Open mixture-of-experts language models, arXiv:2409.02060 (2024).
+
+\bibitem{kvv} R.~M. Karp, U.~V. Vazirani, V.~V. Vazirani, An optimal
+algorithm for on-line bipartite matching, in: ACM STOC, 1990, pp. 352--358.
+
+\bibitem{adwords} A.~Mehta, A.~Saberi, U.~Vazirani, V.~Vazirani, {AdWords}
+and generalized online matching, Journal of the ACM 54 (5) (2007).
+
+\bibitem{buchbinder} N.~Buchbinder, J.~(S.)~Naor, The design of competitive
+online algorithms via a primal--dual approach, Foundations and Trends in
+Theoretical Computer Science 3 (2--3) (2009) 93--263.
+
+\bibitem{devanurhayes} N.~R. Devanur, T.~P. Hayes, The AdWords problem:
+online keyword matching with budgeted bidders under random permutations,
+in: ACM EC, 2009, pp. 71--78.
+
+\bibitem{awy} S.~Agrawal, Z.~Wang, Y.~Ye, A dynamic near-optimal algorithm
+for online linear programming, Operations Research 62 (4) (2014) 876--890.
+
+\bibitem{krtv} T.~Kesselheim, K.~Radke, A.~T\"onnis, B.~V\"ocking, Primal
+beats dual on online packing LPs in the random-order model, in: ACM STOC,
+2014, pp. 303--312.
+
+\bibitem{blm} S.~Balseiro, H.~Lu, V.~Mirrokni, The best of many worlds:
+dual mirror descent for online allocation problems, Operations Research
+71 (1) (2023) 101--119.
+
+\bibitem{twochoices} Y.~Azar, A.~Z. Broder, A.~R. Karlin, E.~Upfal,
+Balanced allocations, SIAM Journal on Computing 29 (1) (1999) 180--200.
+
+\bibitem{mitzenmacher} M.~Mitzenmacher, The power of two choices in
+randomized load balancing, IEEE Transactions on Parallel and Distributed
+Systems 12 (10) (2001) 1094--1104.
+
+\bibitem{sinkhorn} M.~Cuturi, Sinkhorn distances: Lightspeed computation of
+optimal transport, in: NeurIPS, 2013, pp. 2292--2300.
+
+\bibitem{wikitext} S.~Merity, C.~Xiong, J.~Bradbury, R.~Socher, Pointer
+sentinel mixture models, in: ICLR, 2017.
+
+\end{thebibliography}
+
+\end{document}
